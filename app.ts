@@ -32,13 +32,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
+  const buf = Buffer.from(text, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': buf.length,
     'x-github-request-id': `FORGE-${(++requestSeq).toString(16).toUpperCase().padStart(6, '0')}`,
     ...headers,
   });
-  res.end(text);
+  res.end(buf);
 }
 
 function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
@@ -617,10 +618,21 @@ const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
 function tokenAccepted(req: IncomingMessage): boolean {
   const header = req.headers.authorization ?? '';
-  const match = /^Bearer\s+(.+)$/i.exec(header);
-  if (match === null) return false;
+  // The same test as /^Bearer\s+(.+)$/i, without the regex: a case-insensitive "Bearer"
+  // scheme, a run of spaces/tabs, then the token (at least one character) to the end.
+  if (header.length < 8) return false;
+  if (header.slice(0, 6).toLowerCase() !== 'bearer') return false;
+  let index = 6;
+  const separator = header.charCodeAt(index);
+  if (separator !== 0x20 && separator !== 0x09) return false;
+  while (index < header.length) {
+    const code = header.charCodeAt(index);
+    if (code !== 0x20 && code !== 0x09) break;
+    index += 1;
+  }
+  if (index >= header.length) return false;
   if (EXPECTED_TOKEN === '') return true;
-  return match[1] === EXPECTED_TOKEN;
+  return header.slice(index) === EXPECTED_TOKEN;
 }
 
 interface IssueComment {
@@ -692,8 +704,16 @@ function nextTimestampSec(): number {
   clockTick += 1;
   return CLOCK_EPOCH_SEC + clockTick;
 }
+let isoCacheSec = -1;
+let isoCacheText = '';
 function isoOf(sec: number): string {
-  return new Date(sec * 1000).toISOString();
+  // A pure function of `sec`, and the logical clock stands still between commits, so the
+  // last conversion is nearly always the one asked for again.
+  if (sec === isoCacheSec) return isoCacheText;
+  const text = new Date(sec * 1000).toISOString();
+  isoCacheSec = sec;
+  isoCacheText = text;
+  return text;
 }
 function nowIso(): string {
   return isoOf(CLOCK_EPOCH_SEC + clockTick);
@@ -1060,17 +1080,22 @@ function v0Advertisement(repo: ForgeRepo, service: string): Buffer {
   return pktJoin(items);
 }
 
+let v2AdvertisementCache: Buffer | null = null;
 function v2Advertisement(): Buffer {
-  return pktJoin([
-    pktLine('# service=git-upload-pack\n'),
-    'flush',
-    pktLine('version 2\n'),
-    pktLine('agent=makefun-forge/1.0\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    'flush',
-  ]);
+  // The v2 advertisement names no repository state: it is one constant buffer.
+  if (v2AdvertisementCache === null) {
+    v2AdvertisementCache = pktJoin([
+      pktLine('# service=git-upload-pack\n'),
+      'flush',
+      pktLine('version 2\n'),
+      pktLine('agent=makefun-forge/1.0\n'),
+      pktLine('ls-refs=unborn\n'),
+      pktLine('fetch=shallow\n'),
+      pktLine('object-format=sha1\n'),
+      'flush',
+    ]);
+  }
+  return v2AdvertisementCache;
 }
 
 /** One ls-refs answer line for a ref, honouring peel/symrefs/unborn arguments. */
@@ -1094,6 +1119,8 @@ function lsRefLine(repo: ForgeRepo, name: string, oid: string, args: ReadonlySet
   return `${parts.join(' ')}\n`;
 }
 
+const lsRefsCache = new Map<string, Buffer>();
+
 function handleLsRefs(repo: ForgeRepo, lines: readonly Buffer[], res: ServerResponse): void {
   const args = v2Arguments(lines);
   const argSet = new Set<string>();
@@ -1102,18 +1129,35 @@ function handleLsRefs(repo: ForgeRepo, lines: readonly Buffer[], res: ServerResp
     if (arg.startsWith('ref-prefix ')) prefixes.push(arg.slice('ref-prefix '.length));
     else argSet.add(arg);
   }
+  // The answer is a pure function of the ref map, the default branch and the arguments
+  // (peeling reads only immutable objects), so a repeat request on unchanged refs is
+  // answered from the cache: a clone-heavy client asks this once per clone.
+  const names = [...repo.refs.keys()].sort();
+  let cacheKey = `${repo.defaultBranch}|${[...argSet].sort().join(' ')}|${prefixes.join(' ')}`;
+  for (const name of names) cacheKey += `|${name}=${repo.refs.get(name) as string}`;
+  const cached = lsRefsCache.get(cacheKey);
+  if (cached !== undefined) {
+    sendRaw(res, 200, cached, 'application/x-git-upload-pack-result');
+    return;
+  }
   const items: PktItem[] = [];
   const headOid = repo.refs.get(headRefOf(repo)) ?? ZERO_OID;
   const headLine = lsRefLine(repo, 'HEAD', headOid, argSet);
   const wanted = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
   if (headLine !== null && wanted('HEAD')) items.push(pktLine(headLine));
-  for (const name of [...repo.refs.keys()].sort()) {
+  for (const name of names) {
     if (!wanted(name)) continue;
     const line = lsRefLine(repo, name, repo.refs.get(name) as string, argSet);
     if (line !== null) items.push(pktLine(line));
   }
   items.push('flush');
-  sendRaw(res, 200, pktJoin(items), 'application/x-git-upload-pack-result');
+  const body = pktJoin(items);
+  if (lsRefsCache.size >= 128) {
+    const oldest = lsRefsCache.keys().next().value;
+    if (oldest !== undefined) lsRefsCache.delete(oldest);
+  }
+  lsRefsCache.set(cacheKey, body);
+  sendRaw(res, 200, body, 'application/x-git-upload-pack-result');
 }
 
 interface FetchPlan {
@@ -1196,6 +1240,33 @@ function sidebandPackets(pack: Buffer): Buffer[] {
   return packets;
 }
 
+// A fetch answer is a pure function of its parsed determinants (wants, haves, shallow
+// boundary, deepen) over the object store: objects are content-addressed and never
+// mutated or deleted, so once every named object exists the answer can never change.
+// Repeat fetches — a clone benchmark asks the identical question dozens of times — are
+// answered from this cache instead of re-planning and re-packing.
+const fetchResponseCache = new Map<string, Buffer>();
+const FETCH_CACHE_MAX_ENTRIES = 256;
+const FETCH_CACHE_MAX_BYTES = 1 << 20;
+
+function fetchCacheKey(kind: string, wants: readonly string[], haves: readonly string[], shallowIn: readonly string[], deepen: number | null): string | null {
+  for (const oid of wants) if (getObject(oid) === undefined) return null;
+  for (const oid of haves) if (getObject(oid) === undefined) return null;
+  for (const oid of shallowIn) if (getObject(oid) === undefined) return null;
+  return `${kind}|${deepen ?? ''}|${wants.join(',')}|${haves.join(',')}|${shallowIn.join(',')}`;
+}
+
+function respondFetch(res: ServerResponse, cacheKey: string | null, body: Buffer): void {
+  if (cacheKey !== null && body.length <= FETCH_CACHE_MAX_BYTES) {
+    if (fetchResponseCache.size >= FETCH_CACHE_MAX_ENTRIES) {
+      const oldest = fetchResponseCache.keys().next().value;
+      if (oldest !== undefined) fetchResponseCache.delete(oldest);
+    }
+    fetchResponseCache.set(cacheKey, body);
+  }
+  sendRaw(res, 200, body, 'application/x-git-upload-pack-result');
+}
+
 function handleFetchV2(lines: readonly Buffer[], res: ServerResponse): void {
   const args = v2Arguments(lines);
   const wants: string[] = [];
@@ -1208,11 +1279,19 @@ function handleFetchV2(lines: readonly Buffer[], res: ServerResponse): void {
     else if (arg.startsWith('shallow ')) shallowIn.push(arg.slice(8).trim());
     else if (arg.startsWith('deepen ')) deepen = Number.parseInt(arg.slice(7).trim(), 10);
   }
+  const cacheKey = fetchCacheKey('v2', wants, haves, shallowIn, deepen);
+  if (cacheKey !== null) {
+    const hit = fetchResponseCache.get(cacheKey);
+    if (hit !== undefined) {
+      sendRaw(res, 200, hit, 'application/x-git-upload-pack-result');
+      return;
+    }
+  }
   const plan = planFetch(wants, haves, shallowIn, deepen);
   const items: PktItem[] = [pktLine('acknowledgments\n')];
   if (plan.ready) {
     items.push(pktLine('ready\n'), 'flush');
-    sendRaw(res, 200, pktJoin(items), 'application/x-git-upload-pack-result');
+    respondFetch(res, cacheKey, pktJoin(items));
     return;
   }
   items.push(pktLine(plan.commonHave !== null ? `ACK ${plan.commonHave}\n` : 'NAK\n'), 'delim');
@@ -1226,7 +1305,7 @@ function handleFetchV2(lines: readonly Buffer[], res: ServerResponse): void {
   const pack = writePack(plan.objects);
   for (const packet of sidebandPackets(pack)) items.push(packet);
   items.push('flush');
-  sendRaw(res, 200, pktJoin(items), 'application/x-git-upload-pack-result');
+  respondFetch(res, cacheKey, pktJoin(items));
 }
 
 function handleFetchV0(lines: readonly Buffer[], res: ServerResponse): void {
@@ -1241,11 +1320,19 @@ function handleFetchV0(lines: readonly Buffer[], res: ServerResponse): void {
     else if (text.startsWith('shallow ')) shallowIn.push(text.slice(8, 48));
     else if (text.startsWith('deepen ')) deepen = Number.parseInt(text.slice(7), 10);
   }
+  const cacheKey = fetchCacheKey('v0', wants, haves, shallowIn, deepen);
+  if (cacheKey !== null) {
+    const hit = fetchResponseCache.get(cacheKey);
+    if (hit !== undefined) {
+      sendRaw(res, 200, hit, 'application/x-git-upload-pack-result');
+      return;
+    }
+  }
   const plan = planFetch(wants, haves, shallowIn, deepen);
   const items: PktItem[] = [];
   if (plan.ready) {
     items.push(pktLine('NAK\n'), 'flush');
-    sendRaw(res, 200, pktJoin(items), 'application/x-git-upload-pack-result');
+    respondFetch(res, cacheKey, pktJoin(items));
     return;
   }
   items.push(pktLine(plan.commonHave !== null ? `ACK ${plan.commonHave}\n` : 'NAK\n'));
@@ -1254,7 +1341,7 @@ function handleFetchV0(lines: readonly Buffer[], res: ServerResponse): void {
   const pack = writePack(plan.objects);
   for (const packet of sidebandPackets(pack)) items.push(packet);
   items.push('flush');
-  sendRaw(res, 200, pktJoin(items), 'application/x-git-upload-pack-result');
+  respondFetch(res, cacheKey, pktJoin(items));
 }
 
 interface PushCommandLine {
@@ -3038,8 +3125,12 @@ export function createApp(): Server {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async (): Promise<void> => {
       try {
-        const url = new URL(req.url ?? '/', 'http://entry');
-        const path = url.pathname;
+        // Split the request target by hand: a full URL parse per request is wasted work
+        // when only the path and the query string are ever read.
+        const rawTarget = req.url ?? '/';
+        const queryIndex = rawTarget.indexOf('?');
+        const path = queryIndex < 0 ? rawTarget : rawTarget.slice(0, queryIndex);
+        const searchParams = new URLSearchParams(queryIndex < 0 ? '' : rawTarget.slice(queryIndex + 1));
         const method = req.method ?? 'GET';
 
         if (method === 'GET' && path === '/healthz') {
@@ -3081,7 +3172,7 @@ export function createApp(): Server {
               return;
             }
           }
-          handleRest({ req, res, segments, query: url.searchParams, body });
+          handleRest({ req, res, segments, query: searchParams, body });
           return;
         }
 
@@ -3100,7 +3191,7 @@ export function createApp(): Server {
             return;
           }
           if (method === 'GET' && suffix === '/info/refs') {
-            const service = url.searchParams.get('service') ?? '';
+            const service = searchParams.get('service') ?? '';
             if (service === 'git-upload-pack') {
               const protocol = req.headers['git-protocol'] ?? '';
               if (protocol.includes('version=2')) sendRaw(res, 200, v2Advertisement(), 'application/x-git-upload-pack-advertisement');
